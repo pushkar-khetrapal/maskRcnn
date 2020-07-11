@@ -1,12 +1,3 @@
-"""
-Mask R-CNN
-The main Mask R-CNN model implemenetation.
-
-Copyright (c) 2017 Matterport, Inc.
-Licensed under the MIT License (see LICENSE for details)
-Written by Waleed Abdulla
-"""
-
 import datetime
 import math
 import os
@@ -23,8 +14,37 @@ from torch.autograd import Variable
 
 from maskRcnn import maskutils
 from maskRcnn import visualize
+from maskRcnn.config import Config
+#from nms.nms_wrapper import nms
+#from roialign.roi_align.crop_and_resize import CropAndResizeFunction
 
 
+####################################################################################
+################# setting hyper-Parameters EfficientNet B5 #########################
+
+from efficientnet_pytorch import utils
+import collections
+from efficientnet_pytorch import EfficientNet
+
+from torch import nn
+from inplace_abn.abn import InPlaceABN
+
+from efficientnet_pytorch.utils import (
+    round_filters,
+    round_repeats,
+    drop_connect,
+    get_same_padding_conv2d,
+    get_model_params,
+    efficientnet_params,
+    load_pretrained_weights,
+    Swish,
+    MemoryEfficientSwish,
+)
+
+
+from torchvision.ops import nms, roi_align
+
+#########################################################################################
 
 ############################################################
 #  Logging Utility Functions
@@ -118,176 +138,443 @@ class SamePad2d(nn.Module):
         return self.__class__.__name__
 
 
+
+############################################################
+#  setting hyper-Parameters EfficientNet B5
+############################################################
+
+
+# Parameters for the entire model (stem, all blocks, and head)
+GlobalParams = collections.namedtuple('GlobalParams', [
+    'width_coefficient', 'depth_coefficient', 'image_size', 'dropout_rate',
+    'num_classes', 'batch_norm_momentum', 'batch_norm_epsilon',
+    'drop_connect_rate', 'depth_divisor', 'min_depth'])
+
+# Parameters for an individual model block
+BlockArgs = collections.namedtuple('BlockArgs', [
+    'num_repeat', 'kernel_size', 'stride', 'expand_ratio',
+    'input_filters', 'output_filters', 'se_ratio', 'id_skip'])
+
+
+def efficientnet_params(model_name):
+    """ Map EfficientNet model name to parameter coefficients. """
+    params_dict = {
+        # Coefficients:   width,depth,res,dropout
+        'efficientnet-b0': (1.0, 1.0, 224, 0.2),
+        'efficientnet-b1': (1.0, 1.1, 240, 0.2),
+        'efficientnet-b2': (1.1, 1.2, 260, 0.3),
+        'efficientnet-b3': (1.2, 1.4, 300, 0.3),
+        'efficientnet-b4': (1.4, 1.8, 380, 0.4),
+        'efficientnet-b5': (1.6, 2.2, 456, 0.4),
+        'efficientnet-b6': (1.8, 2.6, 528, 0.5),
+        'efficientnet-b7': (2.0, 3.1, 600, 0.5),
+        'efficientnet-b8': (2.2, 3.6, 672, 0.5),
+        'efficientnet-l2': (4.3, 5.3, 800, 0.5),
+    }
+    return params_dict[model_name]
+
+class BlockDecoder(object):
+    """ Block Decoder for readability, straight from the official TensorFlow repository """
+
+    @staticmethod
+    def _decode_block_string(block_string):
+        """ Gets a block through a string notation of arguments. """
+        assert isinstance(block_string, str)
+
+        ops = block_string.split('_')
+        options = {}
+        for op in ops:
+            splits = re.split(r'(\d.*)', op)
+            if len(splits) >= 2:
+                key, value = splits[:2]
+                options[key] = value
+
+        # Check stride
+        assert (('s' in options and len(options['s']) == 1) or
+                (len(options['s']) == 2 and options['s'][0] == options['s'][1]))
+
+        return BlockArgs(
+            kernel_size=int(options['k']),
+            num_repeat=int(options['r']),
+            input_filters=int(options['i']),
+            output_filters=int(options['o']),
+            expand_ratio=int(options['e']),
+            id_skip=('noskip' not in block_string),
+            se_ratio=float(options['se']) if 'se' in options else None,
+            stride=[int(options['s'][0])])
+
+    @staticmethod
+    def _encode_block_string(block):
+        """Encodes a block to a string."""
+        args = [
+            'r%d' % block.num_repeat,
+            'k%d' % block.kernel_size,
+            's%d%d' % (block.strides[0], block.strides[1]),
+            'e%s' % block.expand_ratio,
+            'i%d' % block.input_filters,
+            'o%d' % block.output_filters
+        ]
+        if 0 < block.se_ratio <= 1:
+            args.append('se%s' % block.se_ratio)
+        if block.id_skip is False:
+            args.append('noskip')
+        return '_'.join(args)
+
+    @staticmethod
+    def decode(string_list):
+        """
+        Decodes a list of string notations to specify blocks inside the network.
+
+        :param string_list: a list of strings, each string is a notation of block
+        :return: a list of BlockArgs namedtuples of block args
+        """
+        assert isinstance(string_list, list)
+        blocks_args = []
+        for block_string in string_list:
+            blocks_args.append(BlockDecoder._decode_block_string(block_string))
+        return blocks_args
+
+    @staticmethod
+    def encode(blocks_args):
+        """
+        Encodes a list of BlockArgs to a list of strings.
+
+        :param blocks_args: a list of BlockArgs namedtuples of block args
+        :return: a list of strings, each string is a notation of block
+        """
+        block_strings = []
+        for block in blocks_args:
+            block_strings.append(BlockDecoder._encode_block_string(block))
+        return block_strings
+
+
+def efficientnet(width_coefficient=None, depth_coefficient=None, dropout_rate=0.2,
+                 drop_connect_rate=0.2, image_size=None, num_classes=1000):
+    """ Creates a efficientnet model. """
+
+    blocks_args = [
+        'r1_k3_s11_e1_i32_o16_se0.25', 'r2_k3_s22_e6_i16_o24_se0.25',
+        'r2_k5_s22_e6_i24_o40_se0.25', 'r3_k3_s22_e6_i40_o80_se0.25',
+        'r3_k5_s11_e6_i80_o112_se0.25', 'r4_k5_s22_e6_i112_o192_se0.25',
+        'r1_k3_s11_e6_i192_o320_se0.25',
+    ]
+    blocks_args = BlockDecoder.decode(blocks_args)
+
+    global_params = GlobalParams(
+        batch_norm_momentum=0.99,
+        batch_norm_epsilon=1e-3,
+        dropout_rate=dropout_rate,
+        drop_connect_rate=drop_connect_rate,
+        # data_format='channels_last',  # removed, this is always true in PyTorch
+        num_classes=num_classes,
+        width_coefficient=width_coefficient,
+        depth_coefficient=depth_coefficient,
+        depth_divisor=8,
+        min_depth=None,
+        image_size=image_size,
+    )
+
+    return blocks_args, global_params
+
+
+def get_model_params(model_name, override_params):
+    """ Get the block args and global params for a given model """
+    if model_name.startswith('efficientnet'):
+        w, d, s, p = efficientnet_params(model_name)
+        # note: all models have drop connect rate = 0.2
+        blocks_args, global_params = efficientnet(
+            width_coefficient=w, depth_coefficient=d, dropout_rate=p, image_size=s)
+    else:
+        raise NotImplementedError('model name is not pre-defined: %s' % model_name)
+    if override_params:
+        # ValueError will be raised here if override_params has fields not included in global_params.
+        global_params = global_params._replace(**override_params)
+    return blocks_args, global_params
+
+
+
+############################################################
+#  Efficient B-05 Graph
+############################################################
+
+########################
+###### MB-Blocks #######
+
+
+class MBConvBlock(nn.Module):
+    """
+    Mobile Inverted Residual Bottleneck Block
+
+    Args:
+        block_args (namedtuple): BlockArgs, see above
+        global_params (namedtuple): GlobalParam, see above
+
+    Attributes:
+        has_se (bool): Whether the block contains a Squeeze and Excitation layer.
+    """
+
+    def __init__(self, block_args, global_params):
+        super().__init__()
+        self._block_args = block_args
+        self._bn_mom = 1 - global_params.batch_norm_momentum
+        self._bn_eps = global_params.batch_norm_epsilon
+        self.has_se = (self._block_args.se_ratio is not None) and (0 < self._block_args.se_ratio <= 1)
+        self.id_skip = block_args.id_skip  # skip connection and drop connect
+
+        # Get static or dynamic convolution depending on image size
+        Conv2d = get_same_padding_conv2d(image_size=global_params.image_size)
+
+        # Expansion phase
+        inp = self._block_args.input_filters  # number of input channels
+        oup = self._block_args.input_filters * self._block_args.expand_ratio  # number of output channels
+        if self._block_args.expand_ratio != 1:
+            self._expand_conv = Conv2d(in_channels=inp, out_channels=oup, kernel_size=1, bias=False)
+            self._bn0 = InPlaceABN(oup)
+
+        # Depthwise convolution phase
+        k = self._block_args.kernel_size
+        s = self._block_args.stride
+        self._depthwise_conv = Conv2d(
+            in_channels=oup, out_channels=oup, groups=oup,  # groups makes it depthwise
+            kernel_size=k, stride=s, bias=False)
+        self._bn1 = InPlaceABN(oup)
+
+        # Squeeze and Excitation layer, if desired
+
+        ## Deleted it from here
+
+        # Output phase
+        final_oup = self._block_args.output_filters
+        self._project_conv = Conv2d(in_channels=oup, out_channels=final_oup, kernel_size=1, bias=False)
+        self._bn2 = InPlaceABN(final_oup)
+
+    def forward(self, inputs, drop_connect_rate=None):
+        """
+        :param inputs: input tensor
+        :param drop_connect_rate: drop connect rate (float, between 0 and 1)
+        :return: output of block
+        """
+
+        # Expansion and Depthwise Convolution
+        x = inputs
+        if self._block_args.expand_ratio != 1:
+            x = self._bn0(self._expand_conv(inputs))
+        x = self._bn1(self._depthwise_conv(x))
+
+        # Squeeze and Excitation
+        # Delete SE layer from here
+
+
+        x = self._bn2(self._project_conv(x))
+
+        # Skip connection and drop connect
+        input_filters, output_filters = self._block_args.input_filters, self._block_args.output_filters
+        if self.id_skip and self._block_args.stride == 1 and input_filters == output_filters:
+            if drop_connect_rate:
+                x = drop_connect(x, p=drop_connect_rate, training=self.training)
+            x = x + inputs  # skip connection
+        return x
+
+
+class EfficientNet(nn.Module):
+    """
+    An EfficientNet model. Most easily loaded with the .from_name or .from_pretrained methods
+
+    Args:
+        blocks_args (list): A list of BlockArgs to construct blocks
+        global_params (namedtuple): A set of GlobalParams shared between blocks
+
+    Example:
+        model = EfficientNet.from_pretrained('efficientnet-b0')
+
+    """
+
+    def __init__(self, blocks_args=None, global_params=None):
+        super().__init__()
+        assert isinstance(blocks_args, list), 'blocks_args should be a list'
+        assert len(blocks_args) > 0, 'block args must be greater than 0'
+        self._global_params = global_params
+        self._blocks_args = blocks_args
+
+
+        # Build blocks
+        self._blocks = nn.ModuleList([])
+        self._array = []
+        for block_args in self._blocks_args:
+
+            self.temp = []
+            # Update block input and output filters based on depth multiplier.
+            block_args = block_args._replace(
+                input_filters=round_filters(block_args.input_filters, self._global_params),
+                output_filters=round_filters(block_args.output_filters, self._global_params),
+                num_repeat=round_repeats(block_args.num_repeat, self._global_params)
+            )
+
+            # The first block needs to take care of stride and filter size increase.
+            self._blocks.append(MBConvBlock(block_args, self._global_params))
+            self.temp.append(MBConvBlock(block_args, self._global_params))
+            if block_args.num_repeat > 1:
+                block_args = block_args._replace(input_filters=block_args.output_filters, stride=1)
+            for _ in range(block_args.num_repeat - 1):
+                self._blocks.append(MBConvBlock(block_args, self._global_params))
+                self.temp.append(MBConvBlock(block_args, self._global_params))
+            self._array.append( nn.Sequential(*self.temp))
+
+
+    def extract_features(self, inputs):
+        """ Returns output of the final convolution layer """
+
+        # Blocks
+        for idx, block in enumerate(self._blocks):
+            drop_connect_rate = self._global_params.drop_connect_rate
+            if drop_connect_rate:
+                drop_connect_rate *= float(idx) / len(self._blocks)
+            x = block(inputs, drop_connect_rate=drop_connect_rate)
+            
+        return x
+
+    def forward(self, inputs):
+        """ Calls extract_features to extract features, applies final linear layer, and returns logits. """
+        bs = inputs.size(0)
+        # Convolution layers
+        x = self.extract_features(inputs)
+
+        return x
+    
+    ######## returning the middle blocks 
+    def return_sub(self):
+      return self._array
+
 ############################################################
 #  FPN Graph
 ############################################################
 
-class TopDownLayer(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(TopDownLayer, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1)
-        self.padding2 = SamePad2d(kernel_size=3, stride=1)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1)
+class SeparableConv2d(nn.Module):
+    def __init__(self,in_channels,out_channels,kernel_size,stride=1,padding=1,dilation=1,bias=False):
+        super(SeparableConv2d,self).__init__()
 
-    def forward(self, x, y):
-        y = F.upsample(y, scale_factor=2)
+        self.conv1 = nn.Conv2d(in_channels,in_channels,kernel_size,stride,padding,dilation,groups=in_channels,bias=bias)
+        self.pointwise = nn.Conv2d(in_channels,out_channels,1,1,0,1,1,bias=bias)
+    
+    def forward(self,x):
         x = self.conv1(x)
-        return self.conv2(self.padding2(x+y))
-
-class FPN(nn.Module):
-    def __init__(self, C1, C2, C3, C4, C5, out_channels):
-        super(FPN, self).__init__()
-        self.out_channels = out_channels
-        self.C1 = C1
-        self.C2 = C2
-        self.C3 = C3
-        self.C4 = C4
-        self.C5 = C5
-        self.P6 = nn.MaxPool2d(kernel_size=1, stride=2)
-        self.P5_conv1 = nn.Conv2d(2048, self.out_channels, kernel_size=1, stride=1)
-        self.P5_conv2 = nn.Sequential(
-            SamePad2d(kernel_size=3, stride=1),
-            nn.Conv2d(self.out_channels, self.out_channels, kernel_size=3, stride=1),
-        )
-        self.P4_conv1 =  nn.Conv2d(1024, self.out_channels, kernel_size=1, stride=1)
-        self.P4_conv2 = nn.Sequential(
-            SamePad2d(kernel_size=3, stride=1),
-            nn.Conv2d(self.out_channels, self.out_channels, kernel_size=3, stride=1),
-        )
-        self.P3_conv1 = nn.Conv2d(512, self.out_channels, kernel_size=1, stride=1)
-        self.P3_conv2 = nn.Sequential(
-            SamePad2d(kernel_size=3, stride=1),
-            nn.Conv2d(self.out_channels, self.out_channels, kernel_size=3, stride=1),
-        )
-        self.P2_conv1 = nn.Conv2d(256, self.out_channels, kernel_size=1, stride=1)
-        self.P2_conv2 = nn.Sequential(
-            SamePad2d(kernel_size=3, stride=1),
-            nn.Conv2d(self.out_channels, self.out_channels, kernel_size=3, stride=1),
-        )
-
-    def forward(self, x):
-        x = self.C1(x)
-        x = self.C2(x)
-        c2_out = x
-        x = self.C3(x)
-        c3_out = x
-        x = self.C4(x)
-        c4_out = x
-        x = self.C5(x)
-        p5_out = self.P5_conv1(x)
-        p4_out = self.P4_conv1(c4_out) + F.upsample(p5_out, scale_factor=2)
-        p3_out = self.P3_conv1(c3_out) + F.upsample(p4_out, scale_factor=2)
-        p2_out = self.P2_conv1(c2_out) + F.upsample(p3_out, scale_factor=2)
-
-        p5_out = self.P5_conv2(p5_out)
-        p4_out = self.P4_conv2(p4_out)
-        p3_out = self.P3_conv2(p3_out)
-        p2_out = self.P2_conv2(p2_out)
-
-        # P6 is used for the 5th anchor scale in RPN. Generated by
-        # subsampling from P5 with stride of 2.
-        p6_out = self.P6(p5_out)
-
-        return [p2_out, p3_out, p4_out, p5_out, p6_out]
-
-
-############################################################
-#  Resnet Graph
-############################################################
-
-class Bottleneck(nn.Module):
-    expansion = 4
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
-        super(Bottleneck, self).__init__()
-        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, stride=stride)
-        self.bn1 = nn.BatchNorm2d(planes, eps=0.001, momentum=0.01)
-        self.padding2 = SamePad2d(kernel_size=3, stride=1)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3)
-        self.bn2 = nn.BatchNorm2d(planes, eps=0.001, momentum=0.01)
-        self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1)
-        self.bn3 = nn.BatchNorm2d(planes * 4, eps=0.001, momentum=0.01)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
-        self.stride = stride
-
-    def forward(self, x):
-        residual = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.padding2(out)
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out = self.relu(out)
-
-        out = self.conv3(out)
-        out = self.bn3(out)
-
-        if self.downsample is not None:
-            residual = self.downsample(x)
-
-        out += residual
-        out = self.relu(out)
-
-        return out
-
-class ResNet(nn.Module):
-
-    def __init__(self, architecture, stage5=False):
-        super(ResNet, self).__init__()
-        assert architecture in ["resnet50", "resnet101"]
-        self.inplanes = 64
-        self.layers = [3, 4, {"resnet50": 6, "resnet101": 23}[architecture], 3]
-        self.block = Bottleneck
-        self.stage5 = stage5
-
-        self.C1 = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm2d(64, eps=0.001, momentum=0.01),
-            nn.ReLU(inplace=True),
-            SamePad2d(kernel_size=3, stride=2),
-            nn.MaxPool2d(kernel_size=3, stride=2),
-        )
-        self.C2 = self.make_layer(self.block, 64, self.layers[0])
-        self.C3 = self.make_layer(self.block, 128, self.layers[1], stride=2)
-        self.C4 = self.make_layer(self.block, 256, self.layers[2], stride=2)
-        if self.stage5:
-            self.C5 = self.make_layer(self.block, 512, self.layers[3], stride=2)
-        else:
-            self.C5 = None
-
-    def forward(self, x):
-        x = self.C1(x)
-        x = self.C2(x)
-        x = self.C3(x)
-        x = self.C4(x)
-        x = self.C5(x)
+        x = self.pointwise(x)
         return x
 
 
-    def stages(self):
-        return [self.C1, self.C2, self.C3, self.C4, self.C5]
+class FPN(nn.Module):
+     
+  def __init__(self, blocks,blocks_args=None, global_params=None):
+    super().__init__()
 
-    def make_layer(self, block, planes, blocks, stride=1):
-        downsample = None
-        if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                nn.Conv2d(self.inplanes, planes * block.expansion,
-                          kernel_size=1, stride=stride),
-                nn.BatchNorm2d(planes * block.expansion, eps=0.001, momentum=0.01),
-            )
+    assert isinstance(blocks_args, list), 'blocks_args should be a list'
+    assert len(blocks_args) > 0, 'block args must be greater than 0'
+    self._global_params = global_params
+    self._blocks_args = blocks_args
 
-        layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample))
-        self.inplanes = planes * block.expansion
-        for i in range(1, blocks):
-            layers.append(block(self.inplanes, planes))
+    # Get static or dynamic convolution depending on image size
+    Conv2d = get_same_padding_conv2d(image_size=global_params.image_size)
 
-        return nn.Sequential(*layers)
+    # Stem
+    self._conv_stem = Conv2d(3, 48, kernel_size=3, stride=2, bias=False)
+    self._bn0 = InPlaceABN(48)
 
+    #blocks
+    self.blocks0 = blocks[0]
+    self.blocks1 = blocks[1]
+    self.blocks2 = blocks[2]
+    self.blocks3 = blocks[3]
+    self.blocks4 = blocks[4]
+    self.blocks5 = blocks[5]
+    self.blocks6 = blocks[6]
+
+    # Head
+    self._conv_head = Conv2d(512, 2048, kernel_size=1, bias=False)
+    self._bn1 = InPlaceABN(2048)
+
+    same_Conv2d = get_same_padding_conv2d(image_size=global_params.image_size)
+
+    # upper pyramid
+    self.conv_up1 = same_Conv2d(40, 256, kernel_size=1, stride=1, bias=False)
+    self.conv_up2 = same_Conv2d(64, 256, kernel_size=1, stride=1, bias=False)
+    self.conv_up3 = same_Conv2d(176, 256, kernel_size=1, stride=1, bias=False)
+    self.conv_up4 = same_Conv2d(2048, 256, kernel_size=1, stride=1, bias=False)
+
+    self.inABNone = InPlaceABN(256)
+    self.inABNtwo = InPlaceABN(256)
+    self.inABNthree = InPlaceABN(256)
+    self.inABNfour = InPlaceABN(256)
+
+    #separable
+
+    self.separable1 = SeparableConv2d(256, 256, 3)
+    self.separable2 = SeparableConv2d(256, 256, 3)
+    self.separable3 = SeparableConv2d(256, 256, 3)
+    self.separable4 = SeparableConv2d(256, 256, 3)
+
+    self.SepinABNone = InPlaceABN(256)
+    self.SepinABNtwo = InPlaceABN(256)
+    self.SepinABNthree = InPlaceABN(256)
+    self.SepinABNfour = InPlaceABN(256)
+
+    # upsample bilinear
+
+    self.up1 = nn.Upsample(scale_factor=2, mode='bilinear')
+    self.up2 = nn.Upsample(scale_factor=2, mode='bilinear')
+    self.up3 = nn.Upsample(scale_factor=2, mode='bilinear')
+
+
+    # downsample
+
+    self.down1 = nn.MaxPool2d(2, stride=2)
+    self.down2 = nn.MaxPool2d(2, stride=2)
+    self.down3 = nn.MaxPool2d(2, stride=2)
+
+    
+  def forward(self, x):
+
+      # Stem
+      x = self._bn0(self._conv_stem(x))
+      # Blocks
+      x = self.blocks0(x)
+      x1 = self.blocks1(x)
+      x2 = self.blocks2(x1)
+      x = self.blocks3(x2)
+      x3 = self.blocks4(x)
+      x = self.blocks5(x3)
+      x = self.blocks6(x)
+
+      # Head
+      x4 = self._bn1(self._conv_head(x))
+      
+      #pyramids
+
+      u1 = self.inABNone(self.conv_up1(x1))
+      u2 = self.inABNtwo(self.conv_up2(x2))
+      u3 = self.inABNthree(self.conv_up3(x3))
+      u4 = self.inABNfour(self.conv_up4(x4))
+      
+      uu1 = self.down1(u1) 
+      
+      uu2 = self.down2(uu1) + u3
+      uu3 = self.down3(uu2) + u4
+      
+      low1 = uu3 + u4
+      final1 = self.SepinABNone(self.separable1(low1))
+
+      low2 = u3 + self.up1(u4)
+      final2 = self.SepinABNtwo(self.separable2(low2 + uu2))
+
+      low3 = u2 + self.up2(low2)
+      final3 = self.SepinABNthree(self.separable3(low3 + uu1))
+
+      low4 = u1 + self.up3(low3)
+      final4 = self.SepinABNfour(self.separable4(low4 + u1))
+      
+      return [final4, final3, final2, final1]
+
+
+##########################################################################################
 
 ############################################################
 #  Proposal Layer
@@ -333,11 +620,9 @@ def proposal_layer(inputs, proposal_count, nms_threshold, anchors, config=None):
     to the second stage. Filtering is done based on anchor scores and
     non-max suppression to remove overlaps. It also applies bounding
     box refinment detals to anchors.
-
     Inputs:
         rpn_probs: [batch, anchors, (bg prob, fg prob)]
         rpn_bbox: [batch, anchors, (dy, dx, log(dh), log(dw))]
-
     Returns:
         Proposals in normalized coordinates [batch, rois, (y1, x1, y2, x2)]
     """
@@ -368,7 +653,7 @@ def proposal_layer(inputs, proposal_count, nms_threshold, anchors, config=None):
     # Apply deltas to anchors to get refined anchors.
     # [batch, N, (y1, x1, y2, x2)]
     boxes = apply_box_deltas(anchors, deltas)
-
+    
     # Clip to image boundaries. [batch, N, (y1, x1, y2, x2)]
     height, width = config.IMAGE_SHAPE[:2]
     window = np.array([0, 0, height, width]).astype(np.float32)
@@ -379,7 +664,7 @@ def proposal_layer(inputs, proposal_count, nms_threshold, anchors, config=None):
     # for small objects, so we're skipping it.
 
     # Non-max suppression
-    keep = nms(torch.cat((boxes, scores.unsqueeze(1)), 1).data, nms_threshold)
+    keep = nms(boxes, scores, nms_threshold)
     keep = keep[:proposal_count]
     boxes = boxes[keep, :]
 
@@ -388,7 +673,7 @@ def proposal_layer(inputs, proposal_count, nms_threshold, anchors, config=None):
     if config.GPU_COUNT:
         norm = norm.cuda()
     normalized_boxes = boxes / norm
-
+    
     # Add back batch dimension
     normalized_boxes = normalized_boxes.unsqueeze(0)
 
@@ -401,17 +686,14 @@ def proposal_layer(inputs, proposal_count, nms_threshold, anchors, config=None):
 
 def pyramid_roi_align(inputs, pool_size, image_shape):
     """Implements ROI Pooling on multiple levels of the feature pyramid.
-
     Params:
     - pool_size: [height, width] of the output pooled regions. Usually [7, 7]
     - image_shape: [height, width, channels]. Shape of input image in pixels
-
     Inputs:
     - boxes: [batch, num_boxes, (y1, x1, y2, x2)] in normalized
              coordinates.
     - Feature maps: List of feature maps from different levels of the pyramid.
                     Each is [batch, channels, height, width]
-
     Output:
     Pooled regions in the shape: [num_boxes, height, width, channels].
     The width and height are those specific in the pool_shape in the layer
@@ -474,7 +756,8 @@ def pyramid_roi_align(inputs, pool_size, image_shape):
         if level_boxes.is_cuda:
             ind = ind.cuda()
         feature_maps[i] = feature_maps[i].unsqueeze(0)  #CropAndResizeFunction needs batch dimension
-        pooled_features = CropAndResizeFunction(pool_size, pool_size, 0)(feature_maps[i], level_boxes, ind)
+        
+        pooled_features = roi_align(feature_maps[i], [level_boxes], (pool_size, pool_size))
         pooled.append(pooled_features)
 
     # Pack pooled features into one tensor
@@ -487,7 +770,7 @@ def pyramid_roi_align(inputs, pool_size, image_shape):
     # Rearrange pooled features to match the order of the original boxes
     _, box_to_level = torch.sort(box_to_level)
     pooled = pooled[box_to_level, :, :]
-
+    #print(pooled)
     return pooled
 
 
@@ -533,7 +816,6 @@ def bbox_overlaps(boxes1, boxes2):
 def detection_target_layer(proposals, gt_class_ids, gt_boxes, gt_masks, config):
     """Subsamples proposals and generates target box refinment, class_ids,
     and masks for each.
-
     Inputs:
     proposals: [batch, N, (y1, x1, y2, x2)] in normalized coordinates. Might
                be zero padded if there are not enough proposals.
@@ -541,7 +823,6 @@ def detection_target_layer(proposals, gt_class_ids, gt_boxes, gt_masks, config):
     gt_boxes: [batch, MAX_GT_INSTANCES, (y1, x1, y2, x2)] in normalized
               coordinates.
     gt_masks: [batch, height, width, MAX_GT_INSTANCES] of boolean type
-
     Returns: Target ROIs and corresponding class IDs, bounding box shifts,
     and masks.
     rois: [batch, TRAIN_ROIS_PER_IMAGE, (y1, x1, y2, x2)] in normalized
@@ -613,7 +894,7 @@ def detection_target_layer(proposals, gt_class_ids, gt_boxes, gt_masks, config):
         roi_gt_class_ids = gt_class_ids[roi_gt_box_assignment.data]
 
         # Compute bbox refinement for positive ROIs
-        deltas = Variable(utils.box_refinement(positive_rois.data, roi_gt_boxes.data), requires_grad=False)
+        deltas = Variable(maskutils.box_refinement(positive_rois.data, roi_gt_boxes.data), requires_grad=False)
         std_dev = Variable(torch.from_numpy(config.BBOX_STD_DEV).float(), requires_grad=False)
         if config.GPU_COUNT:
             std_dev = std_dev.cuda()
@@ -639,8 +920,8 @@ def detection_target_layer(proposals, gt_class_ids, gt_boxes, gt_masks, config):
         box_ids = Variable(torch.arange(roi_masks.size()[0]), requires_grad=False).int()
         if config.GPU_COUNT:
             box_ids = box_ids.cuda()
-        masks = Variable(CropAndResizeFunction(config.MASK_SHAPE[0], config.MASK_SHAPE[1], 0)(roi_masks.unsqueeze(1), boxes, box_ids).data, requires_grad=False)
-        masks = masks.squeeze(1)
+        masks = Variable(roi_align(roi_masks, [boxes], (config.MASK_SHAPE[0], config.MASK_SHAPE[1])), requires_grad=False)
+        #masks = masks.squeeze(1)
 
         # Threshold mask pixels at 0.5 to have GT masks be 0 or 1 to use with
         # binary cross entropy loss.
@@ -731,7 +1012,6 @@ def clip_to_window(window, boxes):
 def refine_detections(rois, probs, deltas, window, config):
     """Refine classified proposals and filter overlaps and return final
     detections.
-
     Inputs:
         rois: [N, (y1, x1, y2, x2)] in normalized coordinates
         probs: [N, num_classes]. Class probabilities.
@@ -739,7 +1019,6 @@ def refine_detections(rois, probs, deltas, window, config):
                 bounding box deltas.
         window: (y1, x1, y2, x2) in image coordinates. The part of the image
             that contains the image excluding the padding.
-
     Returns detections shaped: [N, (y1, x1, y2, x2, class_id, score)]
     """
 
@@ -783,7 +1062,7 @@ def refine_detections(rois, probs, deltas, window, config):
     if config.DETECTION_MIN_CONFIDENCE:
         keep_bool = keep_bool & (class_scores >= config.DETECTION_MIN_CONFIDENCE)
     keep = torch.nonzero(keep_bool)[:,0]
-
+    print('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
     # Apply per-class NMS
     pre_nms_class_ids = class_ids[keep.data]
     pre_nms_scores = class_scores[keep.data]
@@ -798,12 +1077,14 @@ def refine_detections(rois, probs, deltas, window, config):
         ix_scores = pre_nms_scores[ixs]
         ix_scores, order = ix_scores.sort(descending=True)
         ix_rois = ix_rois[order.data,:]
-
-        class_keep = nms(torch.cat((ix_rois, ix_scores.unsqueeze(1)), dim=1).data, config.DETECTION_NMS_THRESHOLD)
+        print('---------------------------------------')
+        print(ix_rois.shape)
+        print(ix_scores.shape)
+        class_keep = nms(ix_rois, ix_scores.unsqueeze(1), config.DETECTION_NMS_THRESHOLD)
 
         # Map indicies
         class_keep = keep[ixs[order[class_keep].data].data]
-
+  
         if i==0:
             nms_keep = class_keep
         else:
@@ -827,7 +1108,6 @@ def refine_detections(rois, probs, deltas, window, config):
 def detection_layer(config, rois, mrcnn_class, mrcnn_bbox, image_meta):
     """Takes classified proposal boxes and their bounding box deltas and
     returns the final detection boxes.
-
     Returns:
     [batch, num_detections, (y1, x1, y2, x2, class_score)] in pixels
     """
@@ -842,17 +1122,17 @@ def detection_layer(config, rois, mrcnn_class, mrcnn_bbox, image_meta):
     return detections
 
 
+##################################################################################################
+
 ############################################################
 #  Region Proposal Network
 ############################################################
 
 class RPN(nn.Module):
     """Builds the model of Region Proposal Network.
-
     anchors_per_location: number of anchors per pixel in the feature map
     anchor_stride: Controls the density of anchors. Typically 1 (anchors for
                    every pixel in the feature map), or 2 (every other pixel).
-
     Returns:
         rpn_logits: [batch, H, W, 2] Anchor classifier logits (before softmax)
         rpn_probs: [batch, W, W, 2] Anchor classifier probabilities.
@@ -867,15 +1147,15 @@ class RPN(nn.Module):
         self.depth = depth
 
         self.padding = SamePad2d(kernel_size=3, stride=self.anchor_stride)
-        self.conv_shared = nn.Conv2d(self.depth, 512, kernel_size=3, stride=self.anchor_stride)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv_class = nn.Conv2d(512, 2 * anchors_per_location, kernel_size=1, stride=1)
+        self.conv_shared = nn.Conv2d(256, 256, kernel_size=3, stride=self.anchor_stride)
+        self.inABN = InPlaceABN(256)
+        self.conv_class = nn.Conv2d(256, 2 * anchors_per_location, kernel_size=1, stride=1)
         self.softmax = nn.Softmax(dim=2)
-        self.conv_bbox = nn.Conv2d(512, 4 * anchors_per_location, kernel_size=1, stride=1)
+        self.conv_bbox = nn.Conv2d(256, 4 * anchors_per_location, kernel_size=1, stride=1)
 
     def forward(self, x):
         # Shared convolutional base of the RPN
-        x = self.relu(self.conv_shared(self.padding(x)))
+        x = self.inABN(self.conv_shared(self.padding(x)))
 
         # Anchor Score. [batch, anchors per location * 2, height, width].
         rpn_class_logits = self.conv_class(x)
@@ -911,11 +1191,13 @@ class Classifier(nn.Module):
         self.pool_size = pool_size
         self.image_shape = image_shape
         self.num_classes = num_classes
-        self.conv1 = nn.Conv2d(self.depth, 1024, kernel_size=self.pool_size, stride=1)
-        self.bn1 = nn.BatchNorm2d(1024, eps=0.001, momentum=0.01)
-        self.conv2 = nn.Conv2d(1024, 1024, kernel_size=1, stride=1)
-        self.bn2 = nn.BatchNorm2d(1024, eps=0.001, momentum=0.01)
-        self.relu = nn.ReLU(inplace=True)
+
+        # changed  
+        self.l1 = nn.Linear(7*7*256, 1024)
+        self.l2 = nn.Linear(1024, 1024)
+        self.inABN1 = InPlaceABN(1024)
+        self.inABN2 = InPlaceABN(1024)
+        #
 
         self.linear_class = nn.Linear(1024, num_classes)
         self.softmax = nn.Softmax(dim=1)
@@ -924,14 +1206,13 @@ class Classifier(nn.Module):
 
     def forward(self, x, rois):
         x = pyramid_roi_align([rois]+x, self.pool_size, self.image_shape)
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = self.relu(x)
+        
+        #changed
+        x = x.view(-1,7*7*256)
+        x = self.inABN1(self.l1(x))
+        x = self.inABN2(self.l2(x))
+        #
 
-        x = x.view(-1,1024)
         mrcnn_class_logits = self.linear_class(x)
         mrcnn_probs = self.softmax(mrcnn_class_logits)
 
@@ -947,40 +1228,42 @@ class Mask(nn.Module):
         self.pool_size = pool_size
         self.image_shape = image_shape
         self.num_classes = num_classes
+
+        ## changed here Conv2d -> separableConv2d and batchNorm -> inplaceABN
         self.padding = SamePad2d(kernel_size=3, stride=1)
-        self.conv1 = nn.Conv2d(self.depth, 256, kernel_size=3, stride=1)
-        self.bn1 = nn.BatchNorm2d(256, eps=0.001)
-        self.conv2 = nn.Conv2d(256, 256, kernel_size=3, stride=1)
-        self.bn2 = nn.BatchNorm2d(256, eps=0.001)
-        self.conv3 = nn.Conv2d(256, 256, kernel_size=3, stride=1)
-        self.bn3 = nn.BatchNorm2d(256, eps=0.001)
-        self.conv4 = nn.Conv2d(256, 256, kernel_size=3, stride=1)
-        self.bn4 = nn.BatchNorm2d(256, eps=0.001)
+        self.conv1 = SeparableConv2d(256, 256, 3)
+        self.bn1 = InPlaceABN(256)
+        self.conv2 = SeparableConv2d(256, 256, 3)
+        self.bn2 = InPlaceABN(256)
+        self.conv3 = SeparableConv2d(256, 256, 3)
+        self.bn3 = InPlaceABN(256)
+        self.conv4 = SeparableConv2d(256, 256, 3)
+        self.bn4 = InPlaceABN(256)
         self.deconv = nn.ConvTranspose2d(256, 256, kernel_size=2, stride=2)
+        self.bn5 = InPlaceABN(256)
         self.conv5 = nn.Conv2d(256, num_classes, kernel_size=1, stride=1)
         self.sigmoid = nn.Sigmoid()
-        self.relu = nn.ReLU(inplace=True)
+       
 
     def forward(self, x, rois):
         x = pyramid_roi_align([rois] + x, self.pool_size, self.image_shape)
         x = self.conv1(self.padding(x))
         x = self.bn1(x)
-        x = self.relu(x)
         x = self.conv2(self.padding(x))
         x = self.bn2(x)
-        x = self.relu(x)
         x = self.conv3(self.padding(x))
         x = self.bn3(x)
-        x = self.relu(x)
         x = self.conv4(self.padding(x))
         x = self.bn4(x)
-        x = self.relu(x)
         x = self.deconv(x)
-        x = self.relu(x)
+        x = self.bn5(x)
         x = self.conv5(x)
         x = self.sigmoid(x)
 
         return x
+
+
+################################################################################################
 
 
 ############################################################
@@ -989,7 +1272,6 @@ class Mask(nn.Module):
 
 def compute_rpn_class_loss(rpn_match, rpn_class_logits):
     """RPN anchor classifier loss.
-
     rpn_match: [batch, anchors, 1]. Anchor match type. 1=positive,
                -1=negative, 0=neutral anchor.
     rpn_class_logits: [batch, anchors, 2]. RPN classifier logits for FG/BG.
@@ -1016,7 +1298,6 @@ def compute_rpn_class_loss(rpn_match, rpn_class_logits):
 
 def compute_rpn_bbox_loss(target_bbox, rpn_match, rpn_bbox):
     """Return the RPN bounding box loss graph.
-
     target_bbox: [batch, max positive anchors, (dy, dx, log(dh), log(dw))].
         Uses 0 padding to fill in unsed bbox deltas.
     rpn_match: [batch, anchors, 1]. Anchor match type. 1=positive,
@@ -1045,7 +1326,6 @@ def compute_rpn_bbox_loss(target_bbox, rpn_match, rpn_bbox):
 
 def compute_mrcnn_class_loss(target_class_ids, pred_class_logits):
     """Loss for the classifier head of Mask RCNN.
-
     target_class_ids: [batch, num_rois]. Integer class IDs. Uses zero
         padding to fill in the array.
     pred_class_logits: [batch, num_rois, num_classes]
@@ -1064,7 +1344,6 @@ def compute_mrcnn_class_loss(target_class_ids, pred_class_logits):
 
 def compute_mrcnn_bbox_loss(target_bbox, target_class_ids, pred_bbox):
     """Loss for Mask R-CNN bounding box refinement.
-
     target_bbox: [batch, num_rois, (dy, dx, log(dh), log(dw))]
     target_class_ids: [batch, num_rois]. Integer class IDs.
     pred_bbox: [batch, num_rois, num_classes, (dy, dx, log(dh), log(dw))]
@@ -1093,7 +1372,6 @@ def compute_mrcnn_bbox_loss(target_bbox, target_class_ids, pred_bbox):
 
 def compute_mrcnn_mask_loss(target_masks, target_class_ids, pred_masks):
     """Mask binary cross-entropy loss for the masks head.
-
     target_masks: [batch, num_rois, height, width].
         A float32 tensor of values 0 or 1. Uses zero padding to fill array.
     target_class_ids: [batch, num_rois]. Integer class IDs. Zero padded.
@@ -1131,6 +1409,10 @@ def compute_losses(rpn_match, rpn_bbox, rpn_class_logits, rpn_pred_bbox, target_
     return [rpn_class_loss, rpn_bbox_loss, mrcnn_class_loss, mrcnn_bbox_loss, mrcnn_mask_loss]
 
 
+################################################################################################
+
+
+
 ############################################################
 #  Data Generator
 ############################################################
@@ -1138,7 +1420,6 @@ def compute_losses(rpn_match, rpn_bbox, rpn_class_logits, rpn_pred_bbox, target_
 def load_image_gt(dataset, config, image_id, augment=False,
                   use_mini_mask=False):
     """Load and return ground truth data for an image (image, mask, bounding boxes).
-
     augment: If true, apply random image augmentation. Currently, only
         horizontal flipping is offered.
     use_mini_mask: If False, returns full-size masks that are the same height
@@ -1146,7 +1427,6 @@ def load_image_gt(dataset, config, image_id, augment=False,
         1024x1024x100 (for 100 instances). Mini masks are smaller, typically,
         224x224 and are generated by extracting the bounding box of the
         object and resizing it to MINI_MASK_SHAPE.
-
     Returns:
     image: [height, width, 3]
     shape: the original shape of the image before resizing and cropping.
@@ -1160,12 +1440,12 @@ def load_image_gt(dataset, config, image_id, augment=False,
     image = dataset.load_image(image_id)
     mask, class_ids = dataset.load_mask(image_id)
     shape = image.shape
-    image, window, scale, padding = utils.resize_image(
+    image, window, scale, padding = maskutils.resize_image(
         image,
         min_dim=config.IMAGE_MIN_DIM,
         max_dim=config.IMAGE_MAX_DIM,
         padding=config.IMAGE_PADDING)
-    mask = utils.resize_mask(mask, scale, padding)
+    mask = maskutils.resize_mask(mask, scale, padding)
 
     # Random horizontal flips.
     if augment:
@@ -1176,7 +1456,7 @@ def load_image_gt(dataset, config, image_id, augment=False,
     # Bounding boxes. Note that some boxes might be all zeros
     # if the corresponding mask got cropped out.
     # bbox: [num_instances, (y1, x1, y2, x2)]
-    bbox = utils.extract_bboxes(mask)
+    bbox = maskutils.extract_bboxes(mask)
 
     # Active classes
     # Different datasets have different classes, so track the
@@ -1187,7 +1467,7 @@ def load_image_gt(dataset, config, image_id, augment=False,
 
     # Resize masks to smaller size to reduce memory usage
     if use_mini_mask:
-        mask = utils.minimize_mask(bbox, mask, config.MINI_MASK_SHAPE)
+        mask = maskutils.minimize_mask(bbox, mask, config.MINI_MASK_SHAPE)
 
     # Image meta data
     image_meta = compose_image_meta(image_id, shape, window, active_class_ids)
@@ -1197,11 +1477,9 @@ def load_image_gt(dataset, config, image_id, augment=False,
 def build_rpn_targets(image_shape, anchors, gt_class_ids, gt_boxes, config):
     """Given the anchors and GT boxes, compute overlaps and identify positive
     anchors and deltas to refine them to match their corresponding GT boxes.
-
     anchors: [num_anchors, (y1, x1, y2, x2)]
     gt_class_ids: [num_gt_boxes] Integer class IDs.
     gt_boxes: [num_gt_boxes, (y1, x1, y2, x2)]
-
     Returns:
     rpn_match: [N] (int32) matches between anchors and GT boxes.
                1 = positive anchor, -1 = negative anchor, 0 = neutral
@@ -1223,7 +1501,7 @@ def build_rpn_targets(image_shape, anchors, gt_class_ids, gt_boxes, config):
         gt_class_ids = gt_class_ids[non_crowd_ix]
         gt_boxes = gt_boxes[non_crowd_ix]
         # Compute overlaps with crowd boxes [anchors, crowds]
-        crowd_overlaps = utils.compute_overlaps(anchors, crowd_boxes)
+        crowd_overlaps = maskutils.compute_overlaps(anchors, crowd_boxes)
         crowd_iou_max = np.amax(crowd_overlaps, axis=1)
         no_crowd_bool = (crowd_iou_max < 0.001)
     else:
@@ -1231,7 +1509,7 @@ def build_rpn_targets(image_shape, anchors, gt_class_ids, gt_boxes, config):
         no_crowd_bool = np.ones([anchors.shape[0]], dtype=bool)
 
     # Compute overlaps [num_anchors, num_gt_boxes]
-    overlaps = utils.compute_overlaps(anchors, gt_boxes)
+    overlaps = maskutils.compute_overlaps(anchors, gt_boxes)
 
     # Match anchors to GT Boxes
     # If an anchor overlaps a GT box with IoU >= 0.7 then it's positive.
@@ -1308,13 +1586,11 @@ class Dataset(torch.utils.data.Dataset):
     def __init__(self, dataset, config, augment=True):
         """A generator that returns images and corresponding target class ids,
             bounding box deltas, and masks.
-
             dataset: The Dataset object to pick data from
             config: The model config object
             shuffle: If True, shuffles the samples before every epoch
             augment: If True, applies image augmentation to images (currently only
                      horizontal flips are supported)
-
             Returns a Python generator. Upon calling next() on it, the
             generator returns two lists, inputs and outputs. The containtes
             of the lists differs depending on the received arguments:
@@ -1328,7 +1604,6 @@ class Dataset(torch.utils.data.Dataset):
             - gt_masks: [batch, height, width, MAX_GT_INSTANCES]. The height and width
                         are those of the image unless use_mini_mask is True, in which
                         case they are defined in MINI_MASK_SHAPE.
-
             outputs list: Usually empty in regular training. But if detection_targets
                 is True then the outputs list contains target class_ids, bbox deltas,
                 and masks.
@@ -1344,7 +1619,7 @@ class Dataset(torch.utils.data.Dataset):
 
         # Anchors
         # [anchor_count, (y1, x1, y2, x2)]
-        self.anchors = utils.generate_pyramid_anchors(config.RPN_ANCHOR_SCALES,
+        self.anchors = maskutils.generate_pyramid_anchors(config.RPN_ANCHOR_SCALES,
                                                  config.RPN_ANCHOR_RATIOS,
                                                  config.BACKBONE_SHAPES,
                                                  config.BACKBONE_STRIDES,
@@ -1394,6 +1669,9 @@ class Dataset(torch.utils.data.Dataset):
         return self.image_ids.shape[0]
 
 
+######################################################################################################
+
+
 ############################################################
 #  MaskRCNN Class
 ############################################################
@@ -1402,7 +1680,7 @@ class MaskRCNN(nn.Module):
     """Encapsulates the Mask RCNN model functionality.
     """
 
-    def __init__(self, config, model_dir):
+    def __init__(self, config, model_dir = None):
         """
         config: A Sub-class of the Config class
         model_dir: Directory to save training logs and trained weights
@@ -1415,6 +1693,8 @@ class MaskRCNN(nn.Module):
         self.initialize_weights()
         self.loss_history = []
         self.val_loss_history = []
+        
+
 
     def build(self, config):
         """Build Mask R-CNN architecture.
@@ -1431,21 +1711,30 @@ class MaskRCNN(nn.Module):
         # Bottom-up Layers
         # Returns a list of the last layers of each stage, 5 in total.
         # Don't create the thead (stage 5), so we pick the 4th item in the list.
-        resnet = ResNet("resnet101", stage5=True)
-        C1, C2, C3, C4, C5 = resnet.stages()
 
+        override_params={'num_classes': 1}
+        paras = get_model_params( 'efficientnet-b5', override_params )
+
+        efficientNetModel = EfficientNet(paras[0],paras[1])
+        arr = efficientNetModel.return_sub()
+        
         # Top-down Layers
         # TODO: add assert to varify feature map sizes match what's in config
-        self.fpn = FPN(C1, C2, C3, C4, C5, out_channels=256)
+        
+        self.fpn = FPN( arr, paras[0], paras[1] )
+        self.fpn.to('cuda')
+
+
 
         # Generate Anchors
-        self.anchors = Variable(torch.from_numpy(utils.generate_pyramid_anchors(config.RPN_ANCHOR_SCALES,
+        self.anchors = Variable(torch.from_numpy(maskutils.generate_pyramid_anchors(config.RPN_ANCHOR_SCALES,
                                                                                 config.RPN_ANCHOR_RATIOS,
                                                                                 config.BACKBONE_SHAPES,
                                                                                 config.BACKBONE_STRIDES,
                                                                                 config.RPN_ANCHOR_STRIDE)).float(), requires_grad=False)
         if self.config.GPU_COUNT:
             self.anchors = self.anchors.cuda()
+        
 
         # RPN
         self.rpn = RPN(len(config.RPN_ANCHOR_RATIOS), config.RPN_ANCHOR_STRIDE, 256)
@@ -1456,13 +1745,8 @@ class MaskRCNN(nn.Module):
         # FPN Mask
         self.mask = Mask(256, config.MASK_POOL_SIZE, config.IMAGE_SHAPE, config.NUM_CLASSES)
 
-        # Fix batch norm layers
-        def set_bn_fix(m):
-            classname = m.__class__.__name__
-            if classname.find('BatchNorm') != -1:
-                for p in m.parameters(): p.requires_grad = False
-
-        self.apply(set_bn_fix)
+    def get_anchors(self):
+      return self.anchors
 
     def initialize_weights(self):
         """Initialize model weights.
@@ -1493,7 +1777,6 @@ class MaskRCNN(nn.Module):
 
     def set_log_dir(self, model_path=None):
         """Sets the model log directory and epoch counter.
-
         model_path: If None, or a format different from what this code uses
             then set a new log directory and start epochs from 0. Otherwise,
             extract the log directory and the epoch counter from the file
@@ -1570,9 +1853,7 @@ class MaskRCNN(nn.Module):
 
     def detect(self, images):
         """Runs the detection pipeline.
-
         images: List of images, potentially of different sizes.
-
         Returns a list of dicts, one dict per image. The dict contains:
         rois: [N, (y1, x1, y2, x2)] detection bounding boxes
         class_ids: [N] int class IDs
@@ -1595,7 +1876,6 @@ class MaskRCNN(nn.Module):
 
         # Run object detection
         detections, mrcnn_mask = self.predict([molded_images, image_metas], mode='inference')
-
         # Convert to numpy
         detections = detections.data.cpu().numpy()
         mrcnn_mask = mrcnn_mask.permute(0, 1, 3, 4, 2).data.cpu().numpy()
@@ -1623,20 +1903,14 @@ class MaskRCNN(nn.Module):
         elif mode == 'training':
             self.train()
 
-            # Set batchnorm always in eval mode during training
-            def set_bn_eval(m):
-                classname = m.__class__.__name__
-                if classname.find('BatchNorm') != -1:
-                    m.eval()
-
-            self.apply(set_bn_eval)
 
         # Feature extraction
-        [p2_out, p3_out, p4_out, p5_out, p6_out] = self.fpn(molded_images)
+        [p2_out, p3_out, p4_out, p5_out] = self.fpn(molded_images)
 
         # Note that P6 is used in RPN, but not in the classifier heads.
-        rpn_feature_maps = [p2_out, p3_out, p4_out, p5_out, p6_out]
+        rpn_feature_maps = [p2_out, p3_out, p4_out, p5_out]
         mrcnn_feature_maps = [p2_out, p3_out, p4_out, p5_out]
+
 
         # Loop through pyramid layers
         layer_outputs = []  # list of lists
@@ -1661,10 +1935,10 @@ class MaskRCNN(nn.Module):
                                  nms_threshold=self.config.RPN_NMS_THRESHOLD,
                                  anchors=self.anchors,
                                  config=self.config)
-
         if mode == 'inference':
             # Network Heads
             # Proposal classifier and BBox regressor heads
+            
             mrcnn_class_logits, mrcnn_class, mrcnn_bbox = self.classifier(mrcnn_feature_maps, rpn_rois)
 
             # Detections
@@ -1731,6 +2005,8 @@ class MaskRCNN(nn.Module):
                 mrcnn_mask = self.mask(mrcnn_feature_maps, rois)
 
             return [rpn_class_logits, rpn_bbox, target_class_ids, mrcnn_class_logits, target_deltas, mrcnn_bbox, target_mask, mrcnn_mask]
+       
+
 
     def train_model(self, train_dataset, val_dataset, learning_rate, epochs, layers):
         """Train the model.
@@ -1966,7 +2242,6 @@ class MaskRCNN(nn.Module):
         as an input to the neural network.
         images: List of image matricies [height,width,depth]. Images can have
             different sizes.
-
         Returns 3 Numpy matricies:
         molded_images: [N, h, w, 3]. Images resized and normalized.
         image_metas: [N, length of meta data]. Details about each image.
@@ -1979,7 +2254,7 @@ class MaskRCNN(nn.Module):
         for image in images:
             # Resize image to fit the model expected size
             # TODO: move resizing to mold_image()
-            molded_image, window, scale, padding = utils.resize_image(
+            molded_image, window, scale, padding = maskutils.resize_image(
                 image,
                 min_dim=self.config.IMAGE_MIN_DIM,
                 max_dim=self.config.IMAGE_MAX_DIM,
@@ -2003,13 +2278,11 @@ class MaskRCNN(nn.Module):
         """Reformats the detections of one image from the format of the neural
         network output to a format suitable for use in the rest of the
         application.
-
         detections: [N, (y1, x1, y2, x2, class_id, score)]
         mrcnn_mask: [N, height, width, num_classes]
         image_shape: [height, width, depth] Original size of the image before resizing
         window: [y1, x1, y2, x2] Box in the image where the real image is
                 excluding the padding.
-
         Returns:
         boxes: [N, (y1, x1, y2, x2)] Bounding boxes in pixels
         class_ids: [N] Integer class IDs for each bounding box
@@ -2053,7 +2326,7 @@ class MaskRCNN(nn.Module):
         full_masks = []
         for i in range(N):
             # Convert neural network mask to full size mask
-            full_mask = utils.unmold_mask(masks[i], boxes[i], image_shape)
+            full_mask = maskutils.unmold_mask(masks[i], boxes[i], image_shape)
             full_masks.append(full_mask)
         full_masks = np.stack(full_masks, axis=-1)\
             if full_masks else np.empty((0,) + masks.shape[1:3])
@@ -2068,7 +2341,6 @@ class MaskRCNN(nn.Module):
 def compose_image_meta(image_id, image_shape, window, active_class_ids):
     """Takes attributes of an image and puts them in one 1D array. Use
     parse_image_meta() to parse the values back.
-
     image_id: An int ID of the image. Useful for debugging.
     image_shape: [height, width, channels]
     window: (y1, x1, y2, x2) in pixels. The area of the image where the real
@@ -2101,7 +2373,6 @@ def parse_image_meta(meta):
 def parse_image_meta_graph(meta):
     """Parses a tensor that contains image attributes to its components.
     See compose_image_meta() for more details.
-
     meta: [batch, meta length] where meta length depends on NUM_CLASSES
     """
     image_id = meta[:, 0]
@@ -2122,3 +2393,6 @@ def mold_image(images, config):
 def unmold_image(normalized_images, config):
     """Takes a image normalized with mold() and returns the original."""
     return (normalized_images + config.MEAN_PIXEL).astype(np.uint8)
+
+
+
